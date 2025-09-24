@@ -3,7 +3,9 @@ import json
 import logging
 import os
 import tempfile
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, Tuple
+from datetime import datetime
+import io
 
 # Configurar logging
 logging.basicConfig(level=logging.INFO)
@@ -13,21 +15,18 @@ logger = logging.getLogger(__name__)
 def get_gcp_credentials() -> Optional[Dict[str, Any]]:
     """
     Função ULTRA ROBUSTA para obter credenciais GCP
-    Funciona com múltiplos formatos de configuração
     """
     try:
-        # Verificar se existe a seção gcp
         if "gcp" not in st.secrets:
             st.error("❌ Seção 'gcp' não encontrada nos secrets do Streamlit")
             return None
 
         gcp_config = st.secrets["gcp"]
         
-        # ESTRATÉGIA 1: Campos individuais na raiz de [gcp] - MAIS CONFIÁVEL
+        # ESTRATÉGIA 1: Campos individuais na raiz de [gcp]
         if "type" in gcp_config:
             logger.info("✅ Usando estratégia 1: campos individuais")
             
-            # Montar credenciais campo por campo
             credentials = {
                 "type": gcp_config["type"],
                 "project_id": gcp_config["project_id"],
@@ -49,131 +48,63 @@ def get_gcp_credentials() -> Optional[Dict[str, Any]]:
                     st.error(f"❌ Campo obrigatório '{field}' está vazio")
                     return None
             
-            logger.info(f"✅ Credenciais montadas com sucesso. Project: {credentials['project_id']}")
             return credentials
         
-        # ESTRATÉGIA 2: credentials_safe (formato alternativo)
+        # ESTRATÉGIA 2: credentials_safe
         elif "credentials_safe" in gcp_config:
-            logger.info("✅ Usando estratégia 2: credentials_safe")
-            safe_credentials = dict(gcp_config["credentials_safe"])
-            
-            # Verificar se tem os campos essenciais
-            if "type" in safe_credentials:
-                return safe_credentials
-            else:
-                st.error("❌ Campo 'type' não encontrado em credentials_safe")
-                return None
+            return dict(gcp_config["credentials_safe"])
         
-        # ESTRATÉGIA 3: credentials como string JSON (formato original problemático)
+        # ESTRATÉGIA 3: credentials como JSON string
         elif "credentials" in gcp_config:
-            logger.info("⚠️ Usando estratégia 3: parsing JSON string")
-            
             credentials_raw = gcp_config["credentials"]
             
-            # Se já é um dict
             if isinstance(credentials_raw, dict):
-                if "type" in credentials_raw:
-                    return credentials_raw
-                else:
-                    st.error("❌ Campo 'type' não encontrado no dict de credenciais")
-                    return None
+                return credentials_raw
             
-            # Se é string, fazer parse cuidadoso
             if isinstance(credentials_raw, str):
                 try:
-                    # Limpeza cuidadosa da string
                     clean_json = credentials_raw.strip()
-                    
-                    # Remover aspas externas se existirem
                     if clean_json.startswith('"') and clean_json.endswith('"'):
                         clean_json = clean_json[1:-1]
-                    
-                    # Substituir escapes de aspas
                     clean_json = clean_json.replace('\\"', '"')
-                    
-                    # Parse do JSON
-                    credentials = json.loads(clean_json)
-                    
-                    if "type" in credentials:
-                        logger.info("✅ Parse JSON realizado com sucesso")
-                        return credentials
-                    else:
-                        st.error("❌ Campo 'type' não encontrado no JSON parseado")
-                        return None
-                        
+                    return json.loads(clean_json)
                 except json.JSONDecodeError as e:
                     st.error(f"❌ Erro no parse do JSON: {e}")
-                    logger.error(f"JSON parse error: {e}")
-                    return None
-                except Exception as e:
-                    st.error(f"❌ Erro inesperado no parse: {e}")
                     return None
         
-        # Se chegou aqui, nenhuma estratégia funcionou
         st.error("❌ Nenhum formato válido de credenciais encontrado")
-        st.info("Formatos suportados: campos individuais, credentials_safe, ou credentials JSON")
-        
-        # Debug: mostrar o que foi encontrado
-        available_keys = list(gcp_config.keys())
-        st.write(f"Chaves disponíveis em [gcp]: {available_keys}")
-        
         return None
         
     except Exception as e:
         st.error(f"❌ Erro crítico ao carregar credenciais: {e}")
-        logger.error(f"Critical error in get_gcp_credentials: {e}")
         return None
 
 
 def setup_gcp_credentials() -> bool:
     """
     Configura as credenciais GCP para uso na aplicação
-    Cria arquivo temporário e define variável de ambiente
     """
     try:
-        st.info("🔧 Configurando credenciais do Google Cloud Platform...")
-        
-        # Obter credenciais
         credentials = get_gcp_credentials()
         if credentials is None:
-            st.error("❌ Não foi possível obter as credenciais")
             return False
         
-        # Validação final
-        required_fields = ["type", "project_id", "private_key", "client_email"]
-        for field in required_fields:
-            if field not in credentials or not credentials[field]:
-                st.error(f"❌ Campo obrigatório '{field}' ausente ou vazio")
-                return False
-        
-        # Criar arquivo temporário com as credenciais
+        # Criar arquivo temporário
         with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as temp_file:
             json.dump(credentials, temp_file, indent=2)
             temp_credentials_path = temp_file.name
         
-        # Definir variável de ambiente para o Google Cloud SDK
         os.environ['GOOGLE_APPLICATION_CREDENTIALS'] = temp_credentials_path
-        
-        # Log informações não sensíveis
-        logger.info(f"✅ Credenciais configuradas com sucesso!")
-        logger.info(f"Project ID: {credentials['project_id']}")
-        logger.info(f"Service Account: {credentials['client_email']}")
-        logger.info(f"Credentials file: {temp_credentials_path}")
-        
-        st.success("✅ Credenciais GCP configuradas com sucesso!")
-        
+        logger.info("✅ Credenciais GCP configuradas com sucesso!")
         return True
         
     except Exception as e:
         st.error(f"❌ Erro ao configurar credenciais: {e}")
-        logger.error(f"Error in setup_gcp_credentials: {e}")
         return False
 
 
 def get_gcp_config() -> Dict[str, str]:
-    """
-    Retorna configurações básicas do GCP dos secrets
-    """
+    """Retorna configurações básicas do GCP"""
     try:
         return {
             "project_id": st.secrets["gcp"]["project_id"],
@@ -186,8 +117,219 @@ def get_gcp_config() -> Dict[str, str]:
 
 
 def test_gcp_connection() -> bool:
+    """Testa a conexão com o Google Cloud Storage"""
+    try:
+        from google.cloud import storage
+        
+        config = get_gcp_config()
+        if not config:
+            return False
+        
+        client = storage.Client(project=config["project_id"])
+        bucket = client.bucket(config["bucket_name"])
+        
+        if bucket.exists():
+            st.success(f"✅ Conexão estabelecida com o bucket: {config['bucket_name']}")
+            return True
+        else:
+            st.error(f"❌ Bucket não encontrado: {config['bucket_name']}")
+            return False
+            
+    except Exception as e:
+        st.error(f"❌ Erro na conexão GCP: {e}")
+        return False
+
+
+def criar_pdf_apr(dados_apr: Dict[str, Any]) -> bytes:
     """
-    Testa a conexão com o Google Cloud Storage
+    Cria um PDF da APR usando reportlab
+    """
+    try:
+        from reportlab.lib.pagesizes import A4, letter
+        from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
+        from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+        from reportlab.lib.units import inch
+        from reportlab.lib import colors
+        from reportlab.lib.enums import TA_CENTER, TA_LEFT, TA_JUSTIFY
+        
+    except ImportError:
+        st.error("❌ Biblioteca reportlab não instalada. Instalando...")
+        import subprocess
+        import sys
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "reportlab"])
+        
+        # Tentar importar novamente
+        from reportlab.lib.pagesizes import A4
+        from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
+        from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+        from reportlab.lib.units import inch
+        from reportlab.lib import colors
+        from reportlab.lib.enums import TA_CENTER, TA_LEFT, TA_JUSTIFY
+    
+    # Buffer para o PDF
+    buffer = io.BytesIO()
+    
+    # Criar documento
+    doc = SimpleDocTemplate(
+        buffer,
+        pagesize=A4,
+        rightMargin=72,
+        leftMargin=72,
+        topMargin=72,
+        bottomMargin=18
+    )
+    
+    # Estilos
+    styles = getSampleStyleSheet()
+    
+    title_style = ParagraphStyle(
+        'CustomTitle',
+        parent=styles['Heading1'],
+        fontSize=18,
+        spaceAfter=30,
+        alignment=TA_CENTER,
+        textColor=colors.darkblue
+    )
+    
+    heading_style = ParagraphStyle(
+        'CustomHeading',
+        parent=styles['Heading2'],
+        fontSize=14,
+        spaceAfter=12,
+        spaceBefore=20,
+        textColor=colors.darkblue
+    )
+    
+    normal_style = ParagraphStyle(
+        'CustomNormal',
+        parent=styles['Normal'],
+        fontSize=10,
+        spaceAfter=6,
+        alignment=TA_JUSTIFY
+    )
+    
+    # Conteúdo do documento
+    story = []
+    
+    # Título
+    story.append(Paragraph("ANÁLISE PRELIMINAR DE RISCOS (APR)", title_style))
+    story.append(Spacer(1, 20))
+    
+    # Informações básicas
+    info_data = [
+        ["PROJETO:", dados_apr.get("projeto_nome", "")],
+        ["LOCAL:", dados_apr.get("local_obra", "")],
+        ["RESPONSÁVEL:", dados_apr.get("responsavel", "")],
+        ["DATA INÍCIO:", dados_apr.get("data_inicio", "")],
+        ["DATA TÉRMINO:", dados_apr.get("data_fim", "")],
+        ["TIPO DE ATIVIDADE:", dados_apr.get("tipo_atividade", "")],
+        ["DATA DE ELABORAÇÃO:", datetime.now().strftime("%d/%m/%Y %H:%M")]
+    ]
+    
+    info_table = Table(info_data, colWidths=[2*inch, 4*inch])
+    info_table.setStyle(TableStyle([
+        ('BACKGROUND', (0, 0), (0, -1), colors.lightblue),
+        ('TEXTCOLOR', (0, 0), (0, -1), colors.black),
+        ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
+        ('FONTNAME', (0, 0), (0, -1), 'Helvetica-Bold'),
+        ('FONTNAME', (1, 0), (1, -1), 'Helvetica'),
+        ('FONTSIZE', (0, 0), (-1, -1), 10),
+        ('GRID', (0, 0), (-1, -1), 1, colors.black),
+        ('VALIGN', (0, 0), (-1, -1), 'TOP'),
+    ]))
+    
+    story.append(info_table)
+    story.append(Spacer(1, 20))
+    
+    # Descrição da Atividade
+    story.append(Paragraph("1. DESCRIÇÃO DA ATIVIDADE", heading_style))
+    descricao_text = dados_apr.get("descricao_atividade", "Não informado")
+    story.append(Paragraph(descricao_text, normal_style))
+    story.append(Spacer(1, 15))
+    
+    # Riscos Identificados
+    story.append(Paragraph("2. RISCOS IDENTIFICADOS", heading_style))
+    riscos_text = dados_apr.get("riscos", "Não informado")
+    # Processar lista de riscos
+    riscos_list = riscos_text.split('\n')
+    for risco in riscos_list:
+        if risco.strip():
+            story.append(Paragraph(f"• {risco.strip()}", normal_style))
+    story.append(Spacer(1, 15))
+    
+    # Medidas de Controle
+    story.append(Paragraph("3. MEDIDAS DE CONTROLE E PREVENÇÃO", heading_style))
+    medidas_text = dados_apr.get("medidas_controle", "Não informado")
+    # Processar lista de medidas
+    medidas_list = medidas_text.split('\n')
+    for medida in medidas_list:
+        if medida.strip():
+            story.append(Paragraph(f"• {medida.strip()}", normal_style))
+    story.append(Spacer(1, 20))
+    
+    # Matriz de Riscos (exemplo)
+    story.append(Paragraph("4. MATRIZ DE RISCOS", heading_style))
+    
+    matriz_data = [
+        ["RISCO", "PROBABILIDADE", "SEVERIDADE", "CLASSIFICAÇÃO", "MEDIDAS"],
+        ["Queda em altura", "MÉDIA", "ALTA", "CRÍTICO", "EPI, Guarda-corpo"],
+        ["Choque elétrico", "BAIXA", "ALTA", "MODERADO", "Desenergização"],
+        ["Cortes", "MÉDIA", "MÉDIA", "MODERADO", "EPI, Treinamento"]
+    ]
+    
+    matriz_table = Table(matriz_data, colWidths=[1.5*inch, 1*inch, 1*inch, 1*inch, 1.5*inch])
+    matriz_table.setStyle(TableStyle([
+        ('BACKGROUND', (0, 0), (-1, 0), colors.darkblue),
+        ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
+        ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+        ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+        ('FONTNAME', (0, 1), (-1, -1), 'Helvetica'),
+        ('FONTSIZE', (0, 0), (-1, -1), 9),
+        ('GRID', (0, 0), (-1, -1), 1, colors.black),
+        ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+        ('ROWBACKGROUNDS', (0, 1), (-1, -1), [colors.white, colors.lightgrey])
+    ]))
+    
+    story.append(matriz_table)
+    story.append(Spacer(1, 30))
+    
+    # Assinaturas
+    story.append(Paragraph("5. RESPONSABILIDADES E APROVAÇÕES", heading_style))
+    story.append(Spacer(1, 20))
+    
+    assinatura_data = [
+        ["ELABORADO POR:", "APROVADO POR:", "DATA:"],
+        ["", "", ""],
+        ["_________________________", "_________________________", "_________________"],
+        [dados_apr.get("responsavel", ""), "Supervisor de Segurança", datetime.now().strftime("%d/%m/%Y")]
+    ]
+    
+    assinatura_table = Table(assinatura_data, colWidths=[2*inch, 2*inch, 1.5*inch])
+    assinatura_table.setStyle(TableStyle([
+        ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+        ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+        ('FONTNAME', (0, 3), (-1, 3), 'Helvetica'),
+        ('FONTSIZE', (0, 0), (-1, -1), 10),
+        ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+    ]))
+    
+    story.append(assinatura_table)
+    
+    # Footer
+    story.append(Spacer(1, 40))
+    story.append(Paragraph("Este documento deve ser revisado antes do início das atividades e sempre que houver mudanças nas condições de trabalho.", normal_style))
+    
+    # Construir PDF
+    doc.build(story)
+    
+    # Retornar bytes
+    buffer.seek(0)
+    return buffer.getvalue()
+
+
+def salvar_no_gcs(filename: str, file_bytes: bytes) -> bool:
+    """
+    Salva o arquivo no Google Cloud Storage
     """
     try:
         from google.cloud import storage
@@ -198,60 +340,61 @@ def test_gcp_connection() -> bool:
         
         # Criar cliente
         client = storage.Client(project=config["project_id"])
-        
-        # Testar acesso ao bucket
         bucket = client.bucket(config["bucket_name"])
         
-        # Verificar se o bucket existe e é acessível
-        if bucket.exists():
-            st.success(f"✅ Conexão estabelecida com o bucket: {config['bucket_name']}")
-            logger.info(f"Successfully connected to bucket: {config['bucket_name']}")
-            return True
-        else:
-            st.error(f"❌ Bucket não encontrado: {config['bucket_name']}")
-            return False
-            
+        # Upload do arquivo
+        blob = bucket.blob(filename)
+        blob.upload_from_string(file_bytes, content_type='application/pdf')
+        
+        logger.info(f"✅ Arquivo salvo no GCS: {filename}")
+        return True
+        
     except Exception as e:
-        st.error(f"❌ Erro na conexão GCP: {e}")
-        logger.error(f"GCP connection test failed: {e}")
+        st.error(f"❌ Erro ao salvar no GCS: {e}")
         return False
 
 
-# Função principal que será chamada pelo app.py
-def gerar_apr(*args, **kwargs):
+def gerar_apr(dados_apr: Dict[str, Any]) -> Tuple[Optional[str], Optional[bytes]]:
     """
-    SUA FUNÇÃO ORIGINAL gerar_apr
-    
-    Substitua esta função pela sua implementação original
-    As credenciais GCP já estarão configuradas quando esta função for chamada
+    Função principal para gerar APR
+    Retorna (filename, bytes) ou (None, None) em caso de erro
     """
     try:
-        # Verificar se as credenciais estão configuradas
-        if 'GOOGLE_APPLICATION_CREDENTIALS' not in os.environ:
-            st.error("❌ Credenciais GCP não configuradas")
+        st.info("🔄 Iniciando geração da APR...")
+        
+        # Validar entrada
+        if not dados_apr or not isinstance(dados_apr, dict):
+            st.error("❌ Dados da APR inválidos")
             return None, None
         
-        st.info("🚀 Iniciando geração de APR...")
+        # Gerar nome do arquivo
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        projeto_nome = dados_apr.get("projeto_nome", "projeto").replace(" ", "_")
+        filename = f"APR_{projeto_nome}_{timestamp}.pdf"
         
-        # AQUI VAI SUA IMPLEMENTAÇÃO ORIGINAL
-        # As credenciais já estão configuradas via variável de ambiente
+        st.info("📄 Criando documento PDF...")
         
-        # Exemplo de como usar as configurações:
-        config = get_gcp_config()
-        project_id = config["project_id"]
-        bucket_name = config["bucket_name"]
+        # Criar PDF
+        pdf_bytes = criar_pdf_apr(dados_apr)
         
-        # Sua lógica original aqui...
+        if not pdf_bytes:
+            st.error("❌ Falha na criação do PDF")
+            return None, None
         
-        # Placeholder - substitua pelo seu código real
-        filename = "exemplo_apr.pdf"
-        file_bytes = b"Conteudo do arquivo APR aqui"
+        st.info(f"📊 PDF criado com sucesso ({len(pdf_bytes):,} bytes)")
         
-        st.success("✅ APR gerado com sucesso!")
-        return filename, file_bytes
+        # Tentar salvar no GCS (opcional)
+        st.info("☁️ Salvando no Google Cloud Storage...")
+        if salvar_no_gcs(filename, pdf_bytes):
+            st.success("✅ Arquivo salvo no cloud")
+        else:
+            st.warning("⚠️ Erro ao salvar no cloud, mas PDF foi gerado")
+        
+        logger.info(f"✅ APR gerada com sucesso: {filename}")
+        return filename, pdf_bytes
         
     except Exception as e:
-        st.error(f"❌ Erro na geração do APR: {e}")
+        st.error(f"❌ Erro na geração da APR: {e}")
         logger.error(f"Error in gerar_apr: {e}")
         return None, None
 
@@ -260,58 +403,52 @@ def gerar_apr(*args, **kwargs):
 # INICIALIZAÇÃO DO MÓDULO
 # =========================================================
 
-# Esta parte roda quando o módulo é importado
 try:
     logger.info("🚀 Inicializando pipeline...")
     
-    # Configurar credenciais automaticamente na importação
     if not setup_gcp_credentials():
         st.error("❌ ERRO CRÍTICO: Falha ao configurar credenciais GCP")
-        logger.error("Critical failure: GCP credentials setup failed")
-        st.stop()  # Para a execução do Streamlit
+        st.stop()
     
     logger.info("✅ Pipeline inicializado com sucesso")
     
 except Exception as e:
     st.error(f"❌ ERRO CRÍTICO na inicialização: {e}")
-    logger.error(f"Critical initialization error: {e}")
     st.stop()
 
 
 # =========================================================
-# CÓDIGO DE TESTE (opcional)
+# CÓDIGO DE TESTE
 # =========================================================
 
 if __name__ == "__main__":
-    st.title("🧪 Teste do Pipeline GCP")
+    st.title("🧪 Teste do Pipeline APR")
     
-    st.subheader("1. Status das Credenciais")
-    if 'GOOGLE_APPLICATION_CREDENTIALS' in os.environ:
-        st.success("✅ Variável de ambiente configurada")
-        st.write(f"Arquivo: {os.environ['GOOGLE_APPLICATION_CREDENTIALS']}")
-    else:
-        st.error("❌ Variável de ambiente não configurada")
+    # Dados de teste
+    dados_teste = {
+        "projeto_nome": "Teste de Geração APR",
+        "local_obra": "Local de Teste",
+        "responsavel": "João Silva",
+        "data_inicio": "01/01/2024",
+        "data_fim": "31/12/2024",
+        "tipo_atividade": "Construção Civil",
+        "descricao_atividade": "Teste de geração automática de APR com dados fictícios para validação do sistema.",
+        "riscos": "- Risco de teste 1\n- Risco de teste 2\n- Risco de teste 3",
+        "medidas_controle": "- Medida 1\n- Medida 2\n- Medida 3"
+    }
     
-    st.subheader("2. Configurações GCP")
-    config = get_gcp_config()
-    if config:
-        st.json(config)
-    
-    st.subheader("3. Teste de Conexão")
-    if st.button("Testar Conexão com GCP"):
-        with st.spinner("Testando..."):
-            if test_gcp_connection():
-                st.balloons()
+    if st.button("🚀 Testar Geração de APR"):
+        with st.spinner("Gerando APR de teste..."):
+            filename, file_bytes = gerar_apr(dados_teste)
+            
+            if filename and file_bytes:
+                st.success("✅ APR de teste gerado com sucesso!")
+                
+                st.download_button(
+                    label="📥 Download APR Teste",
+                    data=file_bytes,
+                    file_name=filename,
+                    mime="application/pdf"
+                )
             else:
-                st.error("Falha no teste de conexão")
-    
-    st.subheader("4. Teste da Função APR")
-    if st.button("Testar gerar_apr()"):
-        filename, file_bytes = gerar_apr()
-        if filename and file_bytes:
-            st.download_button(
-                label="📥 Download APR",
-                data=file_bytes,
-                file_name=filename,
-                mime="application/pdf"
-            )
+                st.error("❌ Falha na geração da APR de teste")
