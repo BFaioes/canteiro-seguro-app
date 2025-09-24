@@ -28,7 +28,7 @@ from docx import Document  # para criar template fallback
 # ---------------------------
 PROJECT_ID = st.secrets["gcp"]["project_id"]
 LOCATION   = st.secrets["gcp"]["location"]
-BUCKET     = st.secrets["gcp"]["bucket"]
+BUCKET     = st.secrets["gcp"]["bucket_name"]
 
 # Credenciais a partir de secrets (NÃO usa arquivo no disco)
 CREDS = service_account.Credentials.from_service_account_info(
