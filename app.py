@@ -29,7 +29,7 @@ st.markdown("---")
 
 PROJECT_ID = "arctic-dynamo-467600-k9"
 LOCATION = "us-central1"
-MODEL_NAME = "gemini-1.5-flash-001"
+MODEL_NAME = "gemini-2.5-flash"
 
 # --------------------------------------------------------------------------------------
 # AUTENTICAÇÃO SEGURA (SEM CREDENCIAIS NO CÓDIGO)
