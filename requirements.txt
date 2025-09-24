@@ -1,0 +1,9 @@
+streamlit
+python-docx
+docxtpl
+pypdf
+langchain
+scikit-learn
+numpy
+google-cloud-storage
+google-cloud-aiplatform
