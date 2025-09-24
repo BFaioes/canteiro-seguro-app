@@ -62,7 +62,6 @@ def init_vertexai():
             credentials = None
         
         vertexai.init(project=PROJECT_ID, location=LOCATION, credentials=credentials)
-        st.success("✅ Vertex AI inicializado com sucesso!")
         return True
     except Exception as e:
         st.error(f"❌ Erro na inicialização do Vertex AI: {e}")
@@ -418,7 +417,7 @@ def main():
         """)
         
         st.markdown("---")
-        st.markswith("**Configurações técnicas:**")
+        st.markdown("**Configurações técnicas:**")
         st.code(f"""
         Projeto: {PROJECT_ID}
         Bucket: {BUCKET_NAME}
@@ -436,12 +435,6 @@ def main():
             height=120,
             key="tarefa_input"
         )
-        
-        # Configurações avançadas
-        with st.expander("⚙️ Configurações Avançadas"):
-            st.number_input("Número de referências técnicas", min_value=1, max_value=5, value=3, key="top_k")
-            st.checkbox("Incluir resumo executivo", value=True, key="incluir_resumo")
-            st.checkbox("Validar com normas técnicas", value=True, key="validar_normas")
 
     with col2:
         st.subheader("🚀 Ações")
