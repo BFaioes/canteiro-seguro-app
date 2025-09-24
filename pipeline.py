@@ -1,454 +1,494 @@
+# ======================================================================================
+# PROJETO CANTEIRO SEGURO (v4.0) - STREAMLIT ADAPTAÇÃO
+# ======================================================================================
+
 import streamlit as st
+import vertexai
+from vertexai.generative_models import GenerativeModel
+from vertexai.language_models import TextEmbeddingModel
+from google.cloud import storage
+from sklearn.metrics.pairwise import cosine_similarity
+from docxtpl import DocxTemplate
+import docx
+from docx.shared import Pt
+from docx.oxml import parse_xml
+from docx.oxml.ns import nsdecls
 import json
-import logging
-import os
-import tempfile
-from typing import Dict, Any, Optional, Tuple
+import numpy as np
 from datetime import datetime
-import io
+import pypdf
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+import tempfile
+import os
+from google.oauth2 import service_account
 
-# Configurar logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+# --------------------------------------------------------------------------------------
+# CONFIGURAÇÃO INICIAL DO STREAMLIT
+# --------------------------------------------------------------------------------------
 
+st.set_page_config(
+    page_title="Canteiro Seguro - APR Generator",
+    page_icon="🛡️",
+    layout="wide"
+)
 
-def get_gcp_credentials() -> Optional[Dict[str, Any]]:
-    """
-    Função ULTRA ROBUSTA para obter credenciais GCP
-    """
+st.title("🛡️ Canteiro Seguro - Gerador de APR")
+st.markdown("---")
+
+# --------------------------------------------------------------------------------------
+# ETAPA 1: CONFIGURAÇÕES E AUTENTICAÇÃO
+# --------------------------------------------------------------------------------------
+
+# Configurações do projeto
+PROJECT_ID = "arctic-dynamo-467600-k9"
+BUCKET_NAME = "documentos-apr-bruno-revisao01"
+LOCATION = "us-central1"
+
+# Modelos
+MODELO_DE_EMBEDDING = "text-embedding-004"
+MODELO_DE_GERACAO = "gemini-2.5-flash"
+TOP_K_RAG = 3
+
+# Nomes dos arquivos
+NOME_DO_ARQUIVO_FINAL = "APR_FINALMENTE_PREENCHIDA.docx"
+
+# Autenticação via service account (para Streamlit Cloud)
+@st.cache_resource
+def init_vertexai():
     try:
-        if "gcp" not in st.secrets:
-            st.error("❌ Seção 'gcp' não encontrada nos secrets do Streamlit")
-            return None
+        # Para Streamlit Cloud, use variáveis de ambiente
+        credentials = service_account.Credentials.from_service_account_info(
+            st.secrets["gcp_service_account"]
+        )
+        vertexai.init(project=PROJECT_ID, location=LOCATION, credentials=credentials)
+        return True
+    except Exception as e:
+        st.error(f"Erro na autenticação: {e}")
+        return False
 
-        gcp_config = st.secrets["gcp"]
+# --------------------------------------------------------------------------------------
+# ETAPA 2: FUNÇÕES AUXILIARES
+# --------------------------------------------------------------------------------------
+
+def criar_template_word():
+    """Cria o template Word para a APR"""
+    try:
+        doc = docx.Document()
+        doc.add_heading('ANÁLISE PRELIMINAR DE RISCO (APR)', level=1)
+
+        # Informações básicas
+        p = doc.add_paragraph()
+        p.add_run('Título: ').bold = True
+        doc.add_paragraph('{{ titulo_apr }}')
+
+        p = doc.add_paragraph()
+        p.add_run('Local: ').bold = True
+        doc.add_paragraph('{{ local }}')
+
+        p = doc.add_paragraph()
+        p.add_run('Data: ').bold = True
+        doc.add_paragraph('{{ data_elaboracao }}')
+
+        # Tabela de etapas e riscos
+        doc.add_heading('ETAPAS DA TAREFA, RISCOS E MEDIDAS DE CONTROLE', level=3)
+        table = doc.add_table(rows=2, cols=5)
+        table.style = 'Table Grid'
+        hdr = table.rows[0].cells
+        hdr[0].text = 'Etapa da Tarefa'
+        hdr[1].text = 'Perigos Identificados'
+        hdr[2].text = 'Riscos Associados'
+        hdr[3].text = 'Medidas de Controle Recomendadas'
+        hdr[4].text = 'Classificação do Risco Residual'
+
+        row = table.rows[1].cells
+        row[0].text = '{% for r in etapas_e_riscos %}{{ r.etapa_tarefa }}{% if not loop.last %}\n---\n{% endif %}{% endfor %}'
+        row[1].text = '{% for r in etapas_e_riscos %}{{ r.perigos_identificados|join("\\n- ") }}{% if not loop.last %}\n---\n{% endif %}{% endfor %}'
+        row[2].text = '{% for r in etapas_e_riscos %}{{ r.riscos_associados|join("\\n- ") }}{% if not loop.last %}\n---\n{% endif %}{% endfor %}'
+        row[3].text = '{% for r in etapas_e_riscos %}{{ r.medidas_de_controle_recomendadas|join("\\n- ") }}{% if not loop.last %}\n---\n{% endif %}{% endfor %}'
+        row[4].text = '{% for r in etapas_e_riscos %}{{ r.classificacao_risco_residual }}{% if not loop.last %}\n---\n{% endif %}{% endfor %}'
+
+        # EPIs e procedimentos
+        doc.add_heading('EQUIPAMENTOS DE PROTEÇÃO INDIVIDUAL (EPIs) OBRIGATÓRIOS', level=3)
+        doc.add_paragraph('{{ epis_obrigatorios|join("\\n- ") }}')
+
+        doc.add_heading('PROCEDIMENTOS DE EMERGÊNCIA', level=3)
+        doc.add_paragraph('{{ procedimentos_emergencia }}')
+
+        return doc
+    except Exception as e:
+        st.error(f"Erro ao criar template: {e}")
+        return None
+
+def processar_pdfs():
+    """Processa PDFs do bucket GCS"""
+    try:
+        credentials = service_account.Credentials.from_service_account_info(
+            st.secrets["gcp_service_account"]
+        )
+        storage_client = storage.Client(credentials=credentials, project=PROJECT_ID)
+        bucket = storage_client.bucket(BUCKET_NAME)
+        all_chunks = []
+
+        text_splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=50)
+        MAX_CHARS = 4000
+
+        progress_bar = st.progress(0)
+        status_text = st.empty()
+
+        blobs = list(bucket.list_blobs())
+        total_blobs = len([b for b in blobs if b.name.lower().endswith(".pdf")])
         
-        # ESTRATÉGIA 1: Campos individuais na raiz de [gcp]
-        if "type" in gcp_config:
-            logger.info("✅ Usando estratégia 1: campos individuais")
-            
-            credentials = {
-                "type": gcp_config["type"],
-                "project_id": gcp_config["project_id"],
-                "private_key_id": gcp_config["private_key_id"],
-                "private_key": gcp_config["private_key"],
-                "client_email": gcp_config["client_email"],
-                "client_id": gcp_config["client_id"],
-                "auth_uri": gcp_config["auth_uri"],
-                "token_uri": gcp_config["token_uri"],
-                "auth_provider_x509_cert_url": gcp_config["auth_provider_x509_cert_url"],
-                "client_x509_cert_url": gcp_config["client_x509_cert_url"],
-                "universe_domain": gcp_config["universe_domain"]
-            }
-            
-            # Validar campos essenciais
-            required_fields = ["type", "project_id", "private_key", "client_email"]
-            for field in required_fields:
-                if not credentials.get(field):
-                    st.error(f"❌ Campo obrigatório '{field}' está vazio")
-                    return None
-            
-            return credentials
-        
-        # ESTRATÉGIA 2: credentials_safe
-        elif "credentials_safe" in gcp_config:
-            return dict(gcp_config["credentials_safe"])
-        
-        # ESTRATÉGIA 3: credentials como JSON string
-        elif "credentials" in gcp_config:
-            credentials_raw = gcp_config["credentials"]
-            
-            if isinstance(credentials_raw, dict):
-                return credentials_raw
-            
-            if isinstance(credentials_raw, str):
+        if total_blobs == 0:
+            st.warning("Nenhum PDF encontrado no bucket.")
+            return []
+
+        processed = 0
+        for blob in blobs:
+            if blob.name.lower().endswith(".pdf"):
                 try:
-                    clean_json = credentials_raw.strip()
-                    if clean_json.startswith('"') and clean_json.endswith('"'):
-                        clean_json = clean_json[1:-1]
-                    clean_json = clean_json.replace('\\"', '"')
-                    return json.loads(clean_json)
-                except json.JSONDecodeError as e:
-                    st.error(f"❌ Erro no parse do JSON: {e}")
-                    return None
-        
-        st.error("❌ Nenhum formato válido de credenciais encontrado")
-        return None
-        
+                    status_text.text(f"Processando: {blob.name}")
+                    with blob.open("rb") as pdf_file:
+                        pdf_reader = pypdf.PdfReader(pdf_file)
+                        pdf_text = "".join(page.extract_text() or "" for page in pdf_reader.pages)
+                        
+                        if not pdf_text.strip():
+                            st.warning(f"PDF sem texto: {blob.name}")
+                            continue
+
+                        chunks = text_splitter.split_text(pdf_text)
+                        safe_chunks = [c[:MAX_CHARS] if len(c) > MAX_CHARS else c for c in chunks]
+                        for chunk in safe_chunks:
+                            all_chunks.append({"source": blob.name, "content": chunk})
+                    
+                    processed += 1
+                    progress_bar.progress(processed / total_blobs)
+                    
+                except Exception as e:
+                    st.warning(f"Erro ao processar {blob.name}: {e}")
+                    continue
+
+        status_text.text("✅ Processamento de PDFs concluído!")
+        return all_chunks
+
     except Exception as e:
-        st.error(f"❌ Erro crítico ao carregar credenciais: {e}")
-        return None
+        st.error(f"Erro ao acessar bucket: {e}")
+        return []
 
-
-def setup_gcp_credentials() -> bool:
-    """
-    Configura as credenciais GCP para uso na aplicação
-    """
+def gerar_embeddings(all_chunks):
+    """Gera embeddings para os chunks de texto"""
     try:
-        credentials = get_gcp_credentials()
-        if credentials is None:
-            return False
-        
-        # Criar arquivo temporário
-        with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as temp_file:
-            json.dump(credentials, temp_file, indent=2)
-            temp_credentials_path = temp_file.name
-        
-        os.environ['GOOGLE_APPLICATION_CREDENTIALS'] = temp_credentials_path
-        logger.info("✅ Credenciais GCP configuradas com sucesso!")
-        return True
-        
-    except Exception as e:
-        st.error(f"❌ Erro ao configurar credenciais: {e}")
-        return False
+        embedding_model = TextEmbeddingModel.from_pretrained(MODELO_DE_EMBEDDING)
+        vectors, batch_texts, current_size = [], [], 0
+        MAX_BATCH_CHARS = 15000
 
+        progress_bar = st.progress(0)
+        status_text = st.empty()
 
-def get_gcp_config() -> Dict[str, str]:
-    """Retorna configurações básicas do GCP"""
-    try:
-        return {
-            "project_id": st.secrets["gcp"]["project_id"],
-            "location": st.secrets["gcp"]["location"],
-            "bucket_name": st.secrets["gcp"]["bucket_name"]
-        }
-    except KeyError as e:
-        st.error(f"❌ Configuração GCP ausente: {e}")
-        return {}
-
-
-def test_gcp_connection() -> bool:
-    """Testa a conexão com o Google Cloud Storage"""
-    try:
-        from google.cloud import storage
+        total_chunks = len(all_chunks)
         
-        config = get_gcp_config()
-        if not config:
-            return False
-        
-        client = storage.Client(project=config["project_id"])
-        bucket = client.bucket(config["bucket_name"])
-        
-        if bucket.exists():
-            st.success(f"✅ Conexão estabelecida com o bucket: {config['bucket_name']}")
-            return True
-        else:
-            st.error(f"❌ Bucket não encontrado: {config['bucket_name']}")
-            return False
+        for i, chunk in enumerate(all_chunks):
+            text = chunk["content"]
+            if current_size + len(text) > MAX_BATCH_CHARS and batch_texts:
+                res = embedding_model.get_embeddings(batch_texts)
+                vectors.extend([e.values for e in res])
+                batch_texts, current_size = [], 0
             
+            batch_texts.append(text)
+            current_size += len(text)
+            
+            progress_bar.progress((i + 1) / total_chunks)
+            status_text.text(f"Vetorizando chunk {i+1}/{total_chunks}")
+
+        if batch_texts:
+            res = embedding_model.get_embeddings(batch_texts)
+            vectors.extend([e.values for e in res])
+
+        status_text.text("✅ Vetorização concluída!")
+        return np.array(vectors)
+
     except Exception as e:
-        st.error(f"❌ Erro na conexão GCP: {e}")
-        return False
+        st.error(f"Erro na geração de embeddings: {e}")
+        return None
 
-
-def criar_pdf_apr(dados_apr: Dict[str, Any]) -> bytes:
-    """
-    Cria um PDF da APR usando reportlab
-    """
+def executar_rag(tarefa_usuario, all_chunks, embeddings_array):
+    """Executa o processo RAG"""
     try:
-        from reportlab.lib.pagesizes import A4, letter
-        from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
-        from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-        from reportlab.lib.units import inch
-        from reportlab.lib import colors
-        from reportlab.lib.enums import TA_CENTER, TA_LEFT, TA_JUSTIFY
+        embedding_model = TextEmbeddingModel.from_pretrained(MODELO_DE_EMBEDDING)
         
-    except ImportError:
-        st.error("❌ Biblioteca reportlab não instalada. Instalando...")
-        import subprocess
-        import sys
-        subprocess.check_call([sys.executable, "-m", "pip", "install", "reportlab"])
+        # Embedding da query
+        query_embedding = embedding_model.get_embeddings([tarefa_usuario])[0].values
         
-        # Tentar importar novamente
-        from reportlab.lib.pagesizes import A4
-        from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
-        from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-        from reportlab.lib.units import inch
-        from reportlab.lib import colors
-        from reportlab.lib.enums import TA_CENTER, TA_LEFT, TA_JUSTIFY
-    
-    # Buffer para o PDF
-    buffer = io.BytesIO()
-    
-    # Criar documento
-    doc = SimpleDocTemplate(
-        buffer,
-        pagesize=A4,
-        rightMargin=72,
-        leftMargin=72,
-        topMargin=72,
-        bottomMargin=18
-    )
-    
-    # Estilos
-    styles = getSampleStyleSheet()
-    
-    title_style = ParagraphStyle(
-        'CustomTitle',
-        parent=styles['Heading1'],
-        fontSize=18,
-        spaceAfter=30,
-        alignment=TA_CENTER,
-        textColor=colors.darkblue
-    )
-    
-    heading_style = ParagraphStyle(
-        'CustomHeading',
-        parent=styles['Heading2'],
-        fontSize=14,
-        spaceAfter=12,
-        spaceBefore=20,
-        textColor=colors.darkblue
-    )
-    
-    normal_style = ParagraphStyle(
-        'CustomNormal',
-        parent=styles['Normal'],
-        fontSize=10,
-        spaceAfter=6,
-        alignment=TA_JUSTIFY
-    )
-    
-    # Conteúdo do documento
-    story = []
-    
-    # Título
-    story.append(Paragraph("ANÁLISE PRELIMINAR DE RISCOS (APR)", title_style))
-    story.append(Spacer(1, 20))
-    
-    # Informações básicas
-    info_data = [
-        ["PROJETO:", dados_apr.get("projeto_nome", "")],
-        ["LOCAL:", dados_apr.get("local_obra", "")],
-        ["RESPONSÁVEL:", dados_apr.get("responsavel", "")],
-        ["DATA INÍCIO:", dados_apr.get("data_inicio", "")],
-        ["DATA TÉRMINO:", dados_apr.get("data_fim", "")],
-        ["TIPO DE ATIVIDADE:", dados_apr.get("tipo_atividade", "")],
-        ["DATA DE ELABORAÇÃO:", datetime.now().strftime("%d/%m/%Y %H:%M")]
-    ]
-    
-    info_table = Table(info_data, colWidths=[2*inch, 4*inch])
-    info_table.setStyle(TableStyle([
-        ('BACKGROUND', (0, 0), (0, -1), colors.lightblue),
-        ('TEXTCOLOR', (0, 0), (0, -1), colors.black),
-        ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
-        ('FONTNAME', (0, 0), (0, -1), 'Helvetica-Bold'),
-        ('FONTNAME', (1, 0), (1, -1), 'Helvetica'),
-        ('FONTSIZE', (0, 0), (-1, -1), 10),
-        ('GRID', (0, 0), (-1, -1), 1, colors.black),
-        ('VALIGN', (0, 0), (-1, -1), 'TOP'),
-    ]))
-    
-    story.append(info_table)
-    story.append(Spacer(1, 20))
-    
-    # Descrição da Atividade
-    story.append(Paragraph("1. DESCRIÇÃO DA ATIVIDADE", heading_style))
-    descricao_text = dados_apr.get("descricao_atividade", "Não informado")
-    story.append(Paragraph(descricao_text, normal_style))
-    story.append(Spacer(1, 15))
-    
-    # Riscos Identificados
-    story.append(Paragraph("2. RISCOS IDENTIFICADOS", heading_style))
-    riscos_text = dados_apr.get("riscos", "Não informado")
-    # Processar lista de riscos
-    riscos_list = riscos_text.split('\n')
-    for risco in riscos_list:
-        if risco.strip():
-            story.append(Paragraph(f"• {risco.strip()}", normal_style))
-    story.append(Spacer(1, 15))
-    
-    # Medidas de Controle
-    story.append(Paragraph("3. MEDIDAS DE CONTROLE E PREVENÇÃO", heading_style))
-    medidas_text = dados_apr.get("medidas_controle", "Não informado")
-    # Processar lista de medidas
-    medidas_list = medidas_text.split('\n')
-    for medida in medidas_list:
-        if medida.strip():
-            story.append(Paragraph(f"• {medida.strip()}", normal_style))
-    story.append(Spacer(1, 20))
-    
-    # Matriz de Riscos (exemplo)
-    story.append(Paragraph("4. MATRIZ DE RISCOS", heading_style))
-    
-    matriz_data = [
-        ["RISCO", "PROBABILIDADE", "SEVERIDADE", "CLASSIFICAÇÃO", "MEDIDAS"],
-        ["Queda em altura", "MÉDIA", "ALTA", "CRÍTICO", "EPI, Guarda-corpo"],
-        ["Choque elétrico", "BAIXA", "ALTA", "MODERADO", "Desenergização"],
-        ["Cortes", "MÉDIA", "MÉDIA", "MODERADO", "EPI, Treinamento"]
-    ]
-    
-    matriz_table = Table(matriz_data, colWidths=[1.5*inch, 1*inch, 1*inch, 1*inch, 1.5*inch])
-    matriz_table.setStyle(TableStyle([
-        ('BACKGROUND', (0, 0), (-1, 0), colors.darkblue),
-        ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
-        ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
-        ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
-        ('FONTNAME', (0, 1), (-1, -1), 'Helvetica'),
-        ('FONTSIZE', (0, 0), (-1, -1), 9),
-        ('GRID', (0, 0), (-1, -1), 1, colors.black),
-        ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
-        ('ROWBACKGROUNDS', (0, 1), (-1, -1), [colors.white, colors.lightgrey])
-    ]))
-    
-    story.append(matriz_table)
-    story.append(Spacer(1, 30))
-    
-    # Assinaturas
-    story.append(Paragraph("5. RESPONSABILIDADES E APROVAÇÕES", heading_style))
-    story.append(Spacer(1, 20))
-    
-    assinatura_data = [
-        ["ELABORADO POR:", "APROVADO POR:", "DATA:"],
-        ["", "", ""],
-        ["_________________________", "_________________________", "_________________"],
-        [dados_apr.get("responsavel", ""), "Supervisor de Segurança", datetime.now().strftime("%d/%m/%Y")]
-    ]
-    
-    assinatura_table = Table(assinatura_data, colWidths=[2*inch, 2*inch, 1.5*inch])
-    assinatura_table.setStyle(TableStyle([
-        ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
-        ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
-        ('FONTNAME', (0, 3), (-1, 3), 'Helvetica'),
-        ('FONTSIZE', (0, 0), (-1, -1), 10),
-        ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
-    ]))
-    
-    story.append(assinatura_table)
-    
-    # Footer
-    story.append(Spacer(1, 40))
-    story.append(Paragraph("Este documento deve ser revisado antes do início das atividades e sempre que houver mudanças nas condições de trabalho.", normal_style))
-    
-    # Construir PDF
-    doc.build(story)
-    
-    # Retornar bytes
-    buffer.seek(0)
-    return buffer.getvalue()
+        # Similaridade
+        similarities = cosine_similarity([query_embedding], embeddings_array)[0]
+        top_indices = similarities.argsort()[-TOP_K_RAG:][::-1]
+        selecionados = [all_chunks[i]['content'] for i in top_indices]
 
+        # Resumir chunks
+        gen = GenerativeModel(MODELO_DE_GERACAO)
+        resumos = []
+        
+        for i, chunk in enumerate(selecionados):
+            with st.spinner(f"Resumindo contexto {i+1}/{len(selecionados)}..."):
+                resumo_prompt = f"Resuma tecnicamente este trecho em até 80 palavras, preservando riscos, medidas e citações de NRs:\n\n{chunk[:2000]}"
+                resumo_resp = gen.generate_content(resumo_prompt)
+                resumos.append(resumo_resp.text.strip()[:500])
 
-def salvar_no_gcs(filename: str, file_bytes: bytes) -> bool:
-    """
-    Salva o arquivo no Google Cloud Storage
-    """
-    try:
-        from google.cloud import storage
-        
-        config = get_gcp_config()
-        if not config:
-            return False
-        
-        # Criar cliente
-        client = storage.Client(project=config["project_id"])
-        bucket = client.bucket(config["bucket_name"])
-        
-        # Upload do arquivo
-        blob = bucket.blob(filename)
-        blob.upload_from_string(file_bytes, content_type='application/pdf')
-        
-        logger.info(f"✅ Arquivo salvo no GCS: {filename}")
-        return True
-        
+        contexto_recuperado = "\n---\n".join(resumos)
+        if len(contexto_recuperado) > 3000:
+            contexto_recuperado = contexto_recuperado[:3000] + "... [texto truncado]"
+
+        return contexto_recuperado
+
     except Exception as e:
-        st.error(f"❌ Erro ao salvar no GCS: {e}")
-        return False
+        st.error(f"Erro no RAG: {e}")
+        return ""
 
-
-def gerar_apr(dados_apr: Dict[str, Any]) -> Tuple[Optional[str], Optional[bytes]]:
-    """
-    Função principal para gerar APR
-    Retorna (filename, bytes) ou (None, None) em caso de erro
-    """
+def gerar_apr_ia(tarefa_usuario, contexto_recuperado):
+    """Gera a APR usando IA"""
     try:
-        st.info("🔄 Iniciando geração da APR...")
+        gen = GenerativeModel(MODELO_DE_GERACAO)
+        data_str = datetime.now().strftime("%d/%m/%Y")
         
-        # Validar entrada
-        if not dados_apr or not isinstance(dados_apr, dict):
-            st.error("❌ Dados da APR inválidos")
-            return None, None
-        
-        # Gerar nome do arquivo
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        projeto_nome = dados_apr.get("projeto_nome", "projeto").replace(" ", "_")
-        filename = f"APR_{projeto_nome}_{timestamp}.pdf"
-        
-        st.info("📄 Criando documento PDF...")
-        
-        # Criar PDF
-        pdf_bytes = criar_pdf_apr(dados_apr)
-        
-        if not pdf_bytes:
-            st.error("❌ Falha na criação do PDF")
-            return None, None
-        
-        st.info(f"📊 PDF criado com sucesso ({len(pdf_bytes):,} bytes)")
-        
-        # Tentar salvar no GCS (opcional)
-        st.info("☁️ Salvando no Google Cloud Storage...")
-        if salvar_no_gcs(filename, pdf_bytes):
-            st.success("✅ Arquivo salvo no cloud")
-        else:
-            st.warning("⚠️ Erro ao salvar no cloud, mas PDF foi gerado")
-        
-        logger.info(f"✅ APR gerada com sucesso: {filename}")
-        return filename, pdf_bytes
-        
+        json_exemplo = '''{
+  "titulo_apr": "APR - ATIVIDADE",
+  "local": "Local",
+  "data_elaboracao": "DATA",
+  "etapas_e_riscos": [
+    {
+      "etapa_tarefa": "Etapa",
+      "perigos_identificados": ["Perigo1"],
+      "riscos_associados": ["Risco1"],
+      "medidas_de_controle_recomendadas": ["Medida1 - NR XX"],
+      "classificacao_risco_residual": "Baixo/Médio/Alto"
+    }
+  ],
+  "epis_obrigatorios": ["EPI1"],
+  "procedimentos_emergencia": "Procedimento"
+}'''
+
+        prompt_final = f"""
+# PERSONA
+Você é um Engenheiro de Segurança do Trabalho Sênior, especialista nas NRs e em análise de riscos.
+
+# CONTEXTO (resumos de normas)
+{contexto_recuperado}
+
+# ATIVIDADE
+{tarefa_usuario}
+
+# TAREFA
+Preencha a APR em JSON no formato abaixo, respeitando as regras:
+
+{json_exemplo}
+
+# REGRAS
+- Preencha TODOS os campos do JSON.
+- "epis_obrigatorios" nunca pode ficar vazio.
+- Cite sempre a NR correspondente nas medidas de controle.
+- Responda SOMENTE com JSON válido.
+"""
+
+        with st.spinner("Gerando APR com IA..."):
+            response = gen.generate_content(prompt_final)
+            
+            if not response.text:
+                raise ValueError("Resposta vazia da IA")
+
+            # Extrair JSON
+            txt = response.text.strip()
+            start, end = txt.find('{'), txt.rfind('}') + 1
+            dados_da_apr = json.loads(txt[start:end])
+
+            # Pós-processamento
+            atividade = tarefa_usuario.lower()
+
+            if not dados_da_apr.get("epis_obrigatorios"):
+                dados_da_apr["epis_obrigatorios"] = ["Capacete", "Botas", "Luvas", "Óculos"]
+
+            if "altura" in atividade or "andaime" in atividade:
+                dados_da_apr["epis_obrigatorios"].append("Cinto de segurança tipo paraquedista com talabarte duplo")
+
+            if "confinado" in atividade or "espaço confinado" in atividade:
+                dados_da_apr["epis_obrigatorios"] += ["Detector de gases", "Máscara com filtro", "Cinturão de segurança"]
+
+            if not dados_da_apr.get("procedimentos_emergencia"):
+                dados_da_apr["procedimentos_emergencia"] = (
+                    "Acionar brigada de emergência, aplicar primeiros socorros, evacuar a área e acionar o Corpo de Bombeiros (193)."
+                )
+
+            return dados_da_apr
+
     except Exception as e:
-        st.error(f"❌ Erro na geração da APR: {e}")
-        logger.error(f"Error in gerar_apr: {e}")
-        return None, None
+        st.error(f"Erro na geração da APR: {e}")
+        return None
 
+def criar_documento_final(dados_da_apr):
+    """Cria o documento Word final"""
+    try:
+        doc = docx.Document()
 
-# =========================================================
-# INICIALIZAÇÃO DO MÓDULO
-# =========================================================
+        # Título centralizado
+        title = doc.add_heading('ANÁLISE PRELIMINAR DE RISCO (APR)', level=1)
+        title.alignment = 1
 
-try:
-    logger.info("🚀 Inicializando pipeline...")
+        # Informações básicas
+        p = doc.add_paragraph(); p.add_run('Título: ').bold = True
+        doc.add_paragraph(dados_da_apr.get("titulo_apr", "N/A"))
+
+        p = doc.add_paragraph(); p.add_run('Local: ').bold = True
+        doc.add_paragraph(dados_da_apr.get("local", "N/A"))
+
+        p = doc.add_paragraph(); p.add_run('Data: ').bold = True
+        doc.add_paragraph(dados_da_apr.get("data_elaboracao", datetime.now().strftime("%d/%m/%Y")))
+
+        # Tabela de etapas e riscos
+        doc.add_heading('ETAPAS DA TAREFA, RISCOS E MEDIDAS DE CONTROLE', level=2)
+        table = doc.add_table(rows=1, cols=5)
+        table.style = 'Table Grid'
+        headers = [
+            "Etapa da Tarefa", "Perigos Identificados", "Riscos Associados",
+            "Medidas de Controle Recomendadas", "Classificação do Risco Residual"
+        ]
+        
+        hdr = table.rows[0].cells
+        for i, h in enumerate(headers):
+            hdr[i].text = h
+            for run in hdr[i].paragraphs[0].runs:
+                run.bold = True
+            hdr[i].paragraphs[0].alignment = 1
+            shading = parse_xml(r'<w:shd {} w:fill="D9D9D9"/>'.format(nsdecls('w')))
+            hdr[i]._tc.get_or_add_tcPr().append(shading)
+
+        for etapa in dados_da_apr.get("etapas_e_riscos", []):
+            row = table.add_row().cells
+            row[0].text = etapa.get("etapa_tarefa", "N/A")
+            row[1].text = "\n".join(etapa.get("perigos_identificados", []))
+            row[2].text = "\n".join(etapa.get("riscos_associados", []))
+            row[3].text = "\n".join(etapa.get("medidas_de_controle_recomendadas", []))
+            row[4].text = etapa.get("classificacao_risco_residual", "N/A")
+            
+            for cell in row:
+                for paragraph in cell.paragraphs:
+                    paragraph.paragraph_format.space_after = Pt(6)
+                    paragraph.alignment = 0
+
+        # EPIs
+        doc.add_heading('EQUIPAMENTOS DE PROTEÇÃO INDIVIDUAL (EPIs) OBRIGATÓRIOS', level=2)
+        for epi in dados_da_apr.get("epis_obrigatorios", []):
+            doc.add_paragraph(f"- {epi}", style="List Bullet")
+
+        # Procedimentos
+        doc.add_heading('PROCEDIMENTOS DE EMERGÊNCIA', level=2)
+        doc.add_paragraph(dados_da_apr.get("procedimentos_emergencia", "N/A"))
+
+        return doc
+
+    except Exception as e:
+        st.error(f"Erro ao criar documento: {e}")
+        return None
+
+# --------------------------------------------------------------------------------------
+# INTERFACE PRINCIPAL DO STREAMLIT
+# --------------------------------------------------------------------------------------
+
+def main():
+    # Sidebar com informações
+    st.sidebar.title("ℹ️ Informações")
+    st.sidebar.markdown("""
+    **Como usar:**
+    1. Digite a atividade/serviço
+    2. Clique em Gerar APR
+    3. Aguarde o processamento
+    4. Baixe o documento gerado
     
-    if not setup_gcp_credentials():
-        st.error("❌ ERRO CRÍTICO: Falha ao configurar credenciais GCP")
-        st.stop()
-    
-    logger.info("✅ Pipeline inicializado com sucesso")
-    
-except Exception as e:
-    st.error(f"❌ ERRO CRÍTICO na inicialização: {e}")
-    st.stop()
+    **Funcionalidades:**
+    - ✅ Análise de riscos automatizada
+    - ✅ Baseada em normas técnicas
+    - ✅ Formatação profissional
+    - ✅ Download em Word
+    """)
 
+    # Input principal
+    st.subheader("📋 Descreva a atividade/serviço")
+    tarefa_usuario = st.text_area(
+        "Digite a atividade para gerar a APR:",
+        placeholder="Ex: Trabalho em altura com instalação de equipamentos em torre de 15 metros...",
+        height=100
+    )
 
-# =========================================================
-# CÓDIGO DE TESTE
-# =========================================================
+    if st.button("🛡️ Gerar APR", type="primary", use_container_width=True):
+        if not tarefa_usuario.strip():
+            st.error("Por favor, descreva a atividade/serviço.")
+            return
+
+        # Inicializar Vertex AI
+        if not init_vertexai():
+            return
+
+        # Processar em etapas
+        with st.status("Processando...", expanded=True) as status:
+            # Etapa 1: Processar PDFs
+            status.update(label="📚 Processando PDFs do bucket...", state="running")
+            all_chunks = processar_pdfs()
+            
+            if not all_chunks:
+                st.error("Nenhum conteúdo válido encontrado nos PDFs.")
+                return
+
+            # Etapa 2: Gerar embeddings
+            status.update(label="🔢 Gerando embeddings...", state="running")
+            embeddings_array = gerar_embeddings(all_chunks)
+            
+            if embeddings_array is None:
+                st.error("Erro na geração de embeddings.")
+                return
+
+            # Etapa 3: Executar RAG
+            status.update(label="🔍 Buscando contexto relevante...", state="running")
+            contexto_recuperado = executar_rag(tarefa_usuario, all_chunks, embeddings_array)
+
+            # Etapa 4: Gerar APR com IA
+            status.update(label="🤖 Gerando análise de riscos...", state="running")
+            dados_da_apr = gerar_apr_ia(tarefa_usuario, contexto_recuperado)
+            
+            if dados_da_apr is None:
+                st.error("Erro na geração da APR.")
+                return
+
+            # Etapa 5: Criar documento
+            status.update(label="📄 Formatando documento...", state="running")
+            doc_final = criar_documento_final(dados_da_apr)
+            
+            if doc_final is None:
+                st.error("Erro na criação do documento.")
+                return
+
+            status.update(label="✅ Processo concluído!", state="complete")
+
+        # Salvar e disponibilizar download
+        try:
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".docx") as tmp_file:
+                doc_final.save(tmp_file.name)
+                
+                with open(tmp_file.name, "rb") as file:
+                    st.success("APR gerada com sucesso!")
+                    st.download_button(
+                        label="📥 Download da APR",
+                        data=file,
+                        file_name=NOME_DO_ARQUIVO_FINAL,
+                        mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                        use_container_width=True
+                    )
+            
+            # Limpar arquivo temporário
+            os.unlink(tmp_file.name)
+
+        except Exception as e:
+            st.error(f"Erro ao salvar documento: {e}")
+
+        # Preview dos dados
+        with st.expander("📊 Visualizar dados gerados"):
+            st.json(dados_da_apr)
 
 if __name__ == "__main__":
-    st.title("🧪 Teste do Pipeline APR")
-    
-    # Dados de teste
-    dados_teste = {
-        "projeto_nome": "Teste de Geração APR",
-        "local_obra": "Local de Teste",
-        "responsavel": "João Silva",
-        "data_inicio": "01/01/2024",
-        "data_fim": "31/12/2024",
-        "tipo_atividade": "Construção Civil",
-        "descricao_atividade": "Teste de geração automática de APR com dados fictícios para validação do sistema.",
-        "riscos": "- Risco de teste 1\n- Risco de teste 2\n- Risco de teste 3",
-        "medidas_controle": "- Medida 1\n- Medida 2\n- Medida 3"
-    }
-    
-    if st.button("🚀 Testar Geração de APR"):
-        with st.spinner("Gerando APR de teste..."):
-            filename, file_bytes = gerar_apr(dados_teste)
-            
-            if filename and file_bytes:
-                st.success("✅ APR de teste gerado com sucesso!")
-                
-                st.download_button(
-                    label="📥 Download APR Teste",
-                    data=file_bytes,
-                    file_name=filename,
-                    mime="application/pdf"
-                )
-            else:
-                st.error("❌ Falha na geração da APR de teste")
+    main()
