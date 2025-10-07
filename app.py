@@ -102,8 +102,8 @@ def gerar_embeddings(_chunks):
     model = TextEmbeddingModel.from_pretrained("text-embedding-004")
     text_contents = [chunk["content"] for chunk in _chunks]
     
-    # Processa em lotes para evitar limites da API
-    batch_size = 250 
+    # Processa em lotes para evitar limites da API (limite total por request)
+    batch_size = 50 
     all_embeddings = []
     for i in range(0, len(text_contents), batch_size):
         batch = text_contents[i:i + batch_size]
