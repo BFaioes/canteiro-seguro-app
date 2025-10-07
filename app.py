@@ -245,33 +245,38 @@ def gerar_apr_completa(tarefa_do_usuario, chunks, embeddings_array):
 st.title("👷 Gerador de Análise Preliminar de Risco (APR)")
 st.markdown("Desenvolvido com IA do Google (Vertex AI) e RAG para consulta em Normas Regulamentadoras.")
 
-# Inicializa e carrega os dados
-storage_client = inicializar_vertexai()
-if storage_client:
-    chunks_de_texto = carregar_e_processar_pdfs(storage_client)
-    if chunks_de_texto:
-        vetores = gerar_embeddings(chunks_de_texto)
-        st.success(f"Base de conhecimento carregada com {len(chunks_de_texto)} trechos de normas.")
+# Área de input do usuário (primeiro)
+tarefa_usuario = st.text_area(
+    "**Descreva a atividade ou serviço para a qual a APR será gerada:**",
+    height=100,
+    placeholder="Exemplo: Montagem de andaime fachadeiro com 15 metros de altura para reboco externo."
+)
 
-        # Área de input do usuário
-        tarefa_usuario = st.text_area(
-            "**Descreva a atividade ou serviço para a qual a APR será gerada:**",
-            height=100,
-            placeholder="Exemplo: Montagem de andaime fachadeiro com 15 metros de altura para reboco externo."
-        )
-
-        if st.button("Gerar APR", type="primary", use_container_width=True):
-            if tarefa_usuario and len(vetores) > 0:
-                documento_word = gerar_apr_completa(tarefa_usuario, chunks_de_texto, vetores)
-                
-                if documento_word:
-                    st.balloons()
-                    st.download_button(
-                        label="✔️ Download da APR em .docx",
-                        data=documento_word,
-                        file_name=f"APR_{tarefa_usuario[:20].replace(' ', '_')}.docx",
-                        mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                        use_container_width=True
-                    )
+if st.button("Gerar APR", type="primary", use_container_width=True):
+    if not tarefa_usuario:
+        st.warning("Por favor, descreva a atividade antes de gerar a APR.")
+    else:
+        # Inicializa serviços e carrega base de conhecimento somente após o clique
+        storage_client = inicializar_vertexai()
+        if not storage_client:
+            st.error("Falha na autenticação com o Google Cloud. Verifique os secrets.")
+        else:
+            chunks_de_texto = carregar_e_processar_pdfs(storage_client)
+            if not chunks_de_texto:
+                st.warning("Nenhum conteúdo disponível no bucket para consulta.")
             else:
-                st.warning("Por favor, descreva a atividade e certifique-se de que a base de conhecimento foi carregada.")
+                vetores = gerar_embeddings(chunks_de_texto)
+                if len(vetores) == 0:
+                    st.warning("Não foi possível gerar embeddings para a base de conhecimento.")
+                else:
+                    st.success(f"Base de conhecimento carregada com {len(chunks_de_texto)} trechos de normas.")
+                    documento_word = gerar_apr_completa(tarefa_usuario, chunks_de_texto, vetores)
+                    if documento_word:
+                        st.balloons()
+                        st.download_button(
+                            label="✔️ Download da APR em .docx",
+                            data=documento_word,
+                            file_name=f"APR_{tarefa_usuario[:20].replace(' ', '_')}.docx",
+                            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                            use_container_width=True
+                        )
